@@ -36,7 +36,8 @@ jobs:
           MAIN_URL: ${{ github.event.inputs.main_url || 'https://www.shorts.xxx/user/teressa/' }}
           HOW_MANY: ${{ github.event.inputs.how_many || '75' }}
           CONCURRENCY: "3"
-        run: python scrape.py
+          PYTHONUNBUFFERED: "1"
+        run: python -u scrape.py
 
       - name: Upload results
         if: always()

@@ -1,0 +1,48 @@
+name: Scrape
+
+on:
+  workflow_dispatch:
+    inputs:
+      main_url:
+        description: "Page to scrape"
+        required: false
+        default: "https://www.shorts.xxx/user/teressa/"
+      how_many:
+        description: "How many items"
+        required: false
+        default: "75"
+  # Uncomment to run automatically every day at 02:00 UTC:
+  # schedule:
+  #   - cron: "0 2 * * *"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Run scraper
+        env:
+          MAIN_URL: ${{ github.event.inputs.main_url || 'https://www.shorts.xxx/user/teressa/' }}
+          HOW_MANY: ${{ github.event.inputs.how_many || '75' }}
+          CONCURRENCY: "3"
+        run: python scrape.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrape-results
+          path: output/
+          if-no-files-found: warn

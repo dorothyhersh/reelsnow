@@ -34,8 +34,8 @@ jobs:
       - name: Install dependencies
         run: |
           pip install playwright openpyxl
-          playwright install --with-deps chromium
           curl -fsSL https://rclone.org/install.sh | sudo bash
+          google-chrome --version
 
       - name: Configure rclone for Mega
         env:

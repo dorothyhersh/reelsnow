@@ -22,7 +22,7 @@ AGE_SELECTORS = [
     "button:has-text('18')", "a:has-text('18')",
 ]
 # tried in order; the first one that matches on the page is used
-SELECTORS = [".profileside img.lazyload", "img.lazyload"]
+SELECTORS = [".imgprev img.lazyload", ".profileside img.lazyload", "img.lazyload"]
 
 LIST_JS = """els => els.map(e => {
   const abs = u => { try { return new URL(u, location.href).href; } catch (_) { return null; } };
@@ -281,24 +281,36 @@ async def scroll_all(page, sel, need=None):
     return await page.locator(sel).count()
 
 
+async def pick_selector(page):
+    """Counts thumbnails for every candidate selector and returns the one that matches the MOST."""
+    best, best_n, counts = None, 0, {}
+    for s in SELECTORS:
+        n = await page.locator(s).count()
+        counts[s] = n
+        if n > best_n:               # strict '>' keeps the earlier selector on a tie
+            best, best_n = s, n
+    return best, counts
+
+
 async def load_list(page, main_url, first=False, need=None):
     await page.goto(main_url, wait_until="domcontentloaded", timeout=45000 if first else 30000)
     await page.wait_for_timeout(1500 if first else 500)
     await click_age_gate(page, quick=not first)
-    sel = None
+    sel, counts = None, {}
     for _ in range(30):
-        for s in SELECTORS:
-            if await page.locator(s).count():
-                sel = s
-                break
+        sel, counts = await pick_selector(page)
         if sel:
             break
         await page.wait_for_timeout(500)
     if not sel:
         raise RuntimeError("no thumbnails found on the page")
-    total = await scroll_all(page, sel, need)
+    await page.wait_for_timeout(1500)            # let the main feed load before choosing
+    sel, counts = await pick_selector(page)
+    await scroll_all(page, sel, need)
+    sel, counts = await pick_selector(page)      # the layout may have changed while scrolling
     if first:
-        log(f"Scrolled the page: {total} thumbnails loaded")
+        log(f"Thumbnails per selector: {counts}")
+        log(f"Scrolled the page: {counts[sel]} thumbnails loaded -> using '{sel}'")
     return sel
 
 
@@ -426,7 +438,13 @@ async def scrape_main(browser, ctx, main_url, seen):
     linked   = [r for r in rows if r["href"]]
     unlinked = [r for r in rows if not r["href"]]
     skipped  = [r for r in linked if norm(r["href"]) in seen]
-    linked   = [r for r in linked if norm(r["href"]) not in seen]
+    uniq, seen_h = [], set()                     # a reel can appear twice on a page; open it once
+    for r in linked:
+        k = norm(r["href"])
+        if k not in seen and k not in seen_h:
+            seen_h.add(k)
+            uniq.append(r)
+    linked = uniq
     log(f"Selector '{sel}': {len(info)} thumbnails | {len(linked)} new links, "
         f"{len(skipped)} already saved, {len(unlinked)} need click, {len(ads)} ads ignored")
     if unlinked and debug:

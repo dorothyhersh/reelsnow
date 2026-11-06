@@ -10,7 +10,7 @@ on:
       how_many:
         description: "How many items per main URL"
         required: false
-        default: "75"
+        default: "500"
   # Uncomment to run automatically every day at 02:00 UTC:
   # schedule:
   #   - cron: "0 2 * * *"
@@ -57,7 +57,7 @@ jobs:
       - name: Run scraper
         env:
           MAIN_URLS: ${{ github.event.inputs.main_urls }}
-          HOW_MANY: ${{ github.event.inputs.how_many || '75' }}
+          HOW_MANY: ${{ github.event.inputs.how_many || '500' }}
           CONCURRENCY: "8"
           CLICK_WORKERS: "4"
           PYTHONUNBUFFERED: "1"

@@ -1,0 +1,6 @@
+# One main URL per line. Lines starting with # are ignored.
+# Each URL gets its own tab in results.xlsx on Mega:
+#   /user/teressa/        -> tab "teressa"
+#   ?search=mama+feed     -> tab "mamafeed"
+https://www.shorts.xxx/user/teressa/
+https://www.shorts.xxx/?search=alt

@@ -375,8 +375,9 @@ async def main():
 
     ok_count, total_new = 0, 0
     async with async_playwright() as p:
+        # uses the Google Chrome already installed on GitHub runners (no browser download needed)
         browser = await p.chromium.launch(
-            headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            channel="chrome", headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         ctx = await browser.new_context(
             viewport={"width": 430, "height": 900},
             user_agent=("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "

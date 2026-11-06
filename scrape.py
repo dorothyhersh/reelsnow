@@ -22,7 +22,8 @@ AGE_SELECTORS = [
     "button:has-text('18')", "a:has-text('18')",
 ]
 # tried in order; the first one that matches on the page is used
-SELECTORS = [".imgprev img.lazyload", ".profileside img.lazyload", "img.lazyload"]
+SELECTORS = [".imgprev[onclick*='jumptoid'] img.lazyload",   # reel tiles only (jumptoid / jumptoid2)
+             ".imgprev img.lazyload", ".profileside img.lazyload", "img.lazyload"]
 
 LIST_JS = """els => els.map(e => {
   const abs = u => { try { return new URL(u, location.href).href; } catch (_) { return null; } };
@@ -83,6 +84,11 @@ def norm(u):
 def is_root(u):
     """https://www.shorts.xxx/ is never a reel."""
     return urlparse(u).path.strip("/") == ""
+
+
+def is_reel_url(u):
+    """A real reel page looks like https://www.shorts.xxx/post/208305 (creator pages are /user/..., never saved)."""
+    return re.fullmatch(r"/post/\d+/?", urlparse(u).path) is not None
 
 
 def tab_name(url):
@@ -174,9 +180,21 @@ def sheet_urls(wb):
     for ws in wb.worksheets:
         for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
             v = row[0]
-            if isinstance(v, str) and v.strip().startswith("http") and not is_root(v.strip()):
+            if isinstance(v, str) and v.strip().startswith("http") and is_reel_url(v.strip()):
                 out.append(v.strip())
     return out
+
+
+def purge_bad_rows(wb):
+    """Deletes rows saved by mistake whose URL is not a reel page (creator links, home page, ads)."""
+    removed = 0
+    for ws in wb.worksheets:
+        for r in range(ws.max_row, 1, -1):
+            v = ws.cell(row=r, column=1).value
+            if isinstance(v, str) and v.strip().startswith("http") and not is_reel_url(v.strip()):
+                ws.delete_rows(r)
+                removed += 1
+    return removed
 
 
 def get_ws(wb, name):
@@ -282,13 +300,13 @@ async def scroll_all(page, sel, need=None):
 
 
 async def pick_selector(page):
-    """Counts thumbnails for every candidate selector and returns the one that matches the MOST."""
-    best, best_n, counts = None, 0, {}
+    """Counts thumbnails for every candidate selector; returns the first (most specific) one that matches."""
+    best, counts = None, {}
     for s in SELECTORS:
         n = await page.locator(s).count()
         counts[s] = n
-        if n > best_n:               # strict '>' keeps the earlier selector on a tie
-            best, best_n = s, n
+        if best is None and n > 0:
+            best = s
     return best, counts
 
 
@@ -328,7 +346,7 @@ def add_result(job, n, data):
     title = clean_cell(data.get("title"))
     if not fu.startswith("http") or not title:
         return False
-    if is_root(fu) or "/vast_" in fu or norm(fu) == norm(job["main"]):
+    if not is_reel_url(fu) or norm(fu) == norm(job["main"]):
         return False
     if norm(fu) in job["seen"]:
         return False
@@ -434,7 +452,8 @@ async def scrape_main(browser, ctx, main_url, seen):
     info = info[:HOW_MANY]
     rows = [{"n": i + 1, "href": good_link(x["href"], main_url)} for i, x in enumerate(info)]
     ads      = [r for r in rows if r["href"] and "/vast_" in r["href"]]     # ad tiles, never reels
-    rows     = [r for r in rows if not (r["href"] and "/vast_" in r["href"])]
+    others   = [r for r in rows if r["href"] and "/vast_" not in r["href"] and not is_reel_url(r["href"])]  # creator cards etc.
+    rows     = [r for r in rows if r not in ads and r not in others]
     linked   = [r for r in rows if r["href"]]
     unlinked = [r for r in rows if not r["href"]]
     skipped  = [r for r in linked if norm(r["href"]) in seen]
@@ -446,7 +465,8 @@ async def scrape_main(browser, ctx, main_url, seen):
             uniq.append(r)
     linked = uniq
     log(f"Selector '{sel}': {len(info)} thumbnails | {len(linked)} new links, "
-        f"{len(skipped)} already saved, {len(unlinked)} need click, {len(ads)} ads ignored")
+        f"{len(skipped)} already saved, {len(unlinked)} need click, {len(ads)} ads ignored, "
+        f"{len(others)} non-reel links ignored")
     if unlinked and debug:
         log("Thumbnail HTML (child -> parents) for debugging:")
         for d in debug:
@@ -479,6 +499,9 @@ async def main():
 
     mega_pull()
     wb = load_wb()
+    removed = purge_bad_rows(wb)
+    if removed:
+        log(f"Removed {removed} rows from the sheet that were not reel pages (creator links / home page)")
 
     # What is REALLY saved = the rows in the sheet. The txt is rebuilt from it, so the two can never drift apart.
     seen, seen_list = set(), []
@@ -486,14 +509,14 @@ async def main():
         if norm(u) not in seen:
             seen.add(norm(u))
             seen_list.append(u)
-    txt_urls = [u for u in read_txt() if not is_root(u)]
+    txt_urls = [u for u in read_txt() if is_reel_url(u)]
     txt_only = [u for u in txt_urls if norm(u) not in seen]
     log(f"Sheet rows saved: {len(seen_list)} | urls in txt: {len(txt_urls)}")
     for ws in wb.worksheets:
         log(f"  tab '{ws.title}': {max(ws.max_row - 1, 0)} rows")
     if txt_only:
         log(f"{len(txt_only)} urls were in the txt but NOT in the sheet -> they will be scraped again and saved properly")
-    dirty = bool(txt_only) or len(read_txt()) != len(seen_list)   # txt needs a clean-up upload
+    dirty = bool(txt_only) or removed > 0 or len(read_txt()) != len(seen_list)   # sheet/txt need a clean-up upload
 
     ok_count, total_new = 0, 0
     async with async_playwright() as p:

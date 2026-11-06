@@ -220,6 +220,29 @@ async def click_age_gate(page, quick=False):
     return False
 
 
+# Scrolls the last thumbnail into view AND every scrollable container around it (the feed may scroll
+# inside its own box, not the window), and fires scroll events so the site's infinite-scroll code runs.
+SCROLL_JS = """sel => {
+  const imgs = document.querySelectorAll(sel);
+  const last = imgs[imgs.length - 1];
+  if (last) last.scrollIntoView({block: 'end'});
+  let p = last ? last.parentElement : null;
+  while (p) {
+    const oy = getComputedStyle(p).overflowY;
+    if ((oy === 'auto' || oy === 'scroll') && p.scrollHeight > p.clientHeight) {
+      p.scrollTop = p.scrollHeight; p.dispatchEvent(new Event('scroll'));
+    }
+    p = p.parentElement;
+  }
+  for (const s of ['#contentblock', '.rightside', '.rightsideinner', '.profileside']) {
+    const el = document.querySelector(s);
+    if (el && el.scrollHeight > el.clientHeight) { el.scrollTop = el.scrollHeight; el.dispatchEvent(new Event('scroll')); }
+  }
+  window.scrollTo(0, document.documentElement.scrollHeight);
+  window.dispatchEvent(new Event('scroll'));
+}"""
+
+
 async def click_load_more(page):
     for pat in ("load more", "show more", "view more", "see more"):
         try:
@@ -242,18 +265,19 @@ async def scroll_all(page, sel, need=None):
             break
         if n == last:
             stable += 1
-            if stable >= 4:
+            if stable >= 6:
                 break
         else:
             stable = 0
         last = n
         await click_load_more(page)
         try:
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.evaluate(SCROLL_JS, sel)
         except Exception:
             pass
+        await page.mouse.move(215, 450)          # wheel events go to what is under the mouse
         await page.mouse.wheel(0, 6000)
-        await page.wait_for_timeout(700)
+        await page.wait_for_timeout(1000)
     return await page.locator(sel).count()
 
 

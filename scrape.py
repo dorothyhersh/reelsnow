@@ -33,7 +33,11 @@ LIST_JS = """els => els.map(e => {
     const key = ['href', 'url', 'link', 'path', 'permalink', 'target'].find(x => d[x]);
     if (key) { href = abs(d[key]); break; }
     const oc = node.getAttribute('onclick');
-    if (oc) { const m = oc.match(/['"]([^'"]+)['"]/); if (m) { href = abs(m[1]); break; } }
+    if (oc) {
+      const pid = oc.match(/jumptoid2?[(][ ]*([0-9]+)/);            // jumptoid(203433,'',0) -> /post/203433
+      if (pid) { href = location.origin + '/post/' + pid[1]; break; }
+      const m = oc.match(/['"]([^'"]+)['"]/); if (m) { href = abs(m[1]); break; }
+    }
     if (node.querySelectorAll('img.lazyload').length === 1) {
       const a = node.querySelector('a[href]');
       if (a) { href = abs(a.getAttribute('href')); break; }

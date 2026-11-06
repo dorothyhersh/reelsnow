@@ -3,7 +3,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 from openpyxl import Workbook, load_workbook
 from playwright.async_api import async_playwright
 
-HOW_MANY      = int(os.environ.get("HOW_MANY", "75"))        # items per main URL
+HOW_MANY      = int(os.environ.get("HOW_MANY", "500"))       # max items per main URL
 CONCURRENCY   = int(os.environ.get("CONCURRENCY", "8"))      # parallel tabs for pages that have links
 CLICK_WORKERS = int(os.environ.get("CLICK_WORKERS", "4"))    # parallel workers for click-by-index
 REMOTE        = os.environ.get("MEGA_REMOTE", "mega:")       # rclone remote (root folder of Mega)
@@ -216,18 +216,44 @@ async def click_age_gate(page, quick=False):
     return False
 
 
-async def scroll_all(page, sel):
-    last = 0
-    for _ in range(15):
+async def click_load_more(page):
+    for pat in ("load more", "show more", "view more", "see more"):
+        try:
+            loc = page.locator(f"text=/{pat}/i").first
+            if await loc.count() and await loc.is_visible():
+                await loc.click(timeout=1500)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+async def scroll_all(page, sel, need=None):
+    """Keep scrolling (and pressing 'load more') until no new thumbnails appear for 4 rounds in a row."""
+    need = need or HOW_MANY
+    last, stable = 0, 0
+    for _ in range(80):
         n = await page.locator(sel).count()
-        if n >= HOW_MANY or n == last:
+        if n >= need:
             break
+        if n == last:
+            stable += 1
+            if stable >= 4:
+                break
+        else:
+            stable = 0
         last = n
-        await page.mouse.wheel(0, 5000)
-        await page.wait_for_timeout(400)
+        await click_load_more(page)
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            pass
+        await page.mouse.wheel(0, 6000)
+        await page.wait_for_timeout(700)
+    return await page.locator(sel).count()
 
 
-async def load_list(page, main_url, first=False):
+async def load_list(page, main_url, first=False, need=None):
     await page.goto(main_url, wait_until="domcontentloaded", timeout=45000 if first else 30000)
     await page.wait_for_timeout(1500 if first else 500)
     await click_age_gate(page, quick=not first)
@@ -242,7 +268,9 @@ async def load_list(page, main_url, first=False):
         await page.wait_for_timeout(500)
     if not sel:
         raise RuntimeError("no thumbnails found on the page")
-    await scroll_all(page, sel)
+    total = await scroll_all(page, sel, need)
+    if first:
+        log(f"Scrolled the page: {total} thumbnails loaded")
     return sel
 
 
@@ -290,8 +318,9 @@ async def click_worker(browser, cookies, wid, job, rows):
     Each worker has its OWN browser context, so workers can never touch each other's tabs."""
     wctx = await make_ctx(browser, cookies)
     page = await wctx.new_page()
+    need_all = max(r["n"] for r in rows)         # make sure this worker's highest index is loaded
     try:
-        sel = await load_list(page, job["main"])
+        sel = await load_list(page, job["main"], need=need_all)
     except Exception as e:
         log(f"[worker {wid}] cannot load list: {str(e)[:80]}")
         await wctx.close()
@@ -303,7 +332,7 @@ async def click_worker(browser, cookies, wid, job, rows):
             before_url = page.url
             ok = await page.evaluate(CLICK_JS, [sel, n - 1])
             if not ok:
-                sel = await load_list(page, job["main"])
+                sel = await load_list(page, job["main"], need=need_all)
                 ok = await page.evaluate(CLICK_JS, [sel, n - 1])
             target = None
             for _ in range(30):                      # wait up to ~6s for a new tab or URL change
@@ -328,11 +357,11 @@ async def click_worker(browser, cookies, wid, job, rows):
             if target is not page:
                 await target.close()
             else:
-                sel = await load_list(page, job["main"])   # back to the list
+                sel = await load_list(page, job["main"], need=need_all)   # back to the list
         except Exception as e:
             log(f"[{n}] click fail: {str(e)[:70]}")
             try:
-                sel = await load_list(page, job["main"])
+                sel = await load_list(page, job["main"], need=need_all)
             except Exception:
                 pass
     await wctx.close()

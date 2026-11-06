@@ -1,10 +1,11 @@
 import os, json, asyncio, csv, time
 from playwright.async_api import async_playwright
 
-MAIN_URL     = os.environ.get("MAIN_URL", "https://www.shorts.xxx/user/teressa/")  # put the real address here
-HOW_MANY     = int(os.environ.get("HOW_MANY", "75"))
-CONCURRENCY  = int(os.environ.get("CONCURRENCY", "8"))
-SKIP_DETAILS = os.environ.get("SKIP_DETAILS", "0") == "1"   # 1 = only collect the list (fastest)
+MAIN_URL       = os.environ.get("MAIN_URL", "https://www.shorts.xxx/user/teressa/")  # put the real address here
+HOW_MANY       = int(os.environ.get("HOW_MANY", "75"))
+CONCURRENCY    = int(os.environ.get("CONCURRENCY", "8"))       # parallel tabs for pages that have links
+CLICK_WORKERS  = int(os.environ.get("CLICK_WORKERS", "4"))     # parallel tabs for click-by-index
+SKIP_DETAILS   = os.environ.get("SKIP_DETAILS", "0") == "1"    # 1 = only collect the list (fastest)
 OUT = "output"
 os.makedirs(OUT, exist_ok=True)
 
@@ -15,11 +16,45 @@ AGE_SELECTORS = [
 ]
 THUMBS = ".profileside img.lazyload"
 
-LIST_JS = """els => els.map(e => ({
-  alt: e.alt,
-  src: e.getAttribute('data-src') || e.getAttribute('data-original') || e.src || null,
-  href: e.closest('a') ? e.closest('a').href : null
-}))"""
+# Finds the link for each thumbnail: <a>, data-* attributes, onclick, or a single <a> inside the card
+LIST_JS = """els => els.map(e => {
+  const abs = u => { try { return new URL(u, location.href).href; } catch (_) { return null; } };
+  let href = null, node = e;
+  for (let k = 0; k < 6 && node && node !== document.body; k++, node = node.parentElement) {
+    if (node.tagName === 'A' && node.getAttribute('href')) { href = abs(node.getAttribute('href')); break; }
+    const d = node.dataset || {};
+    const key = ['href', 'url', 'link', 'path', 'permalink', 'target'].find(x => d[x]);
+    if (key) { href = abs(d[key]); break; }
+    const oc = node.getAttribute('onclick');
+    if (oc) { const m = oc.match(/['"]([^'"]+)['"]/); if (m) { href = abs(m[1]); break; } }
+    if (node.querySelectorAll('img.lazyload').length === 1) {
+      const a = node.querySelector('a[href]');
+      if (a) { href = abs(a.getAttribute('href')); break; }
+    }
+  }
+  return {
+    alt: e.alt,
+    src: e.getAttribute('data-src') || e.getAttribute('data-original') || e.src || null,
+    href: href
+  };
+})"""
+
+DEBUG_JS = """() => {
+  const e = document.querySelector('.profileside img.lazyload');
+  if (!e) return null;
+  const out = []; let n = e;
+  for (let k = 0; k < 3 && n && n !== document.body; k++, n = n.parentElement) out.push(n.outerHTML.slice(0, 400));
+  return out;
+}"""
+
+CLICK_JS = """(i) => {
+  const img = document.querySelectorAll('.profileside img.lazyload')[i];
+  if (!img) return false;
+  img.scrollIntoView({block: 'center'});
+  const a = img.closest('a');
+  (a || img).click();
+  return true;
+}"""
 
 EXTRACT_JS = """() => {
   const m = n => (document.querySelector(`meta[property="${n}"],meta[name="${n}"]`)||{}).content || null;
@@ -55,7 +90,7 @@ async def click_age_gate(page, quick=False):
 
 
 async def route_light(route):
-    # detail pages only: skip images / media / fonts to load much faster
+    # after phase 1: skip images / media / fonts so pages load much faster
     if route.request.resource_type in ("image", "media", "font"):
         await route.abort()
     else:
@@ -78,14 +113,39 @@ def save(rows, name):
         w.writerows(rows)
 
 
+async def scroll_all(page):
+    last = 0
+    for _ in range(15):
+        n = await page.locator(THUMBS).count()
+        if n >= HOW_MANY or n == last:
+            break
+        last = n
+        await page.mouse.wheel(0, 5000)
+        await page.wait_for_timeout(400)
+
+
+async def load_list(page, first=False):
+    await page.goto(MAIN_URL, wait_until="domcontentloaded", timeout=45000 if first else 30000)
+    await page.wait_for_timeout(1500 if first else 500)
+    await click_age_gate(page, quick=not first)
+    await page.wait_for_selector(THUMBS, timeout=15000, state="attached")
+    await scroll_all(page)
+
+
+def good_link(h):
+    if not h or not h.startswith("http"):
+        return None
+    if h.split("#")[0].rstrip("/") == MAIN_URL.rstrip("/"):
+        return None
+    return h
+
+
 async def scrape_link(ctx, sem, row, results):
     async with sem:
         pg = await ctx.new_page()
         try:
-            await pg.route("**/*", route_light)
             await pg.goto(row["href"], wait_until="domcontentloaded", timeout=20000)
             data = await pg.evaluate(EXTRACT_JS)
-            # age gate showing again? click once and re-read
             if not (data.get("og_title") or data.get("h1")):
                 if await click_age_gate(pg, quick=True):
                     data = await pg.evaluate(EXTRACT_JS)
@@ -95,6 +155,57 @@ async def scrape_link(ctx, sem, row, results):
             log(f"[{row['n']}] fail {row['href']}: {str(e)[:70]}")
         finally:
             await pg.close()
+
+
+async def click_worker(ctx, wid, rows, results):
+    """For thumbnails without a link: click by index, read the page that opens, come back."""
+    page = await ctx.new_page()
+    try:
+        await load_list(page)
+    except Exception as e:
+        log(f"[worker {wid}] cannot load list: {str(e)[:80]}")
+        await page.close()
+        return
+    for row in rows:
+        n = row["n"]
+        try:
+            before_pages = set(ctx.pages)
+            before_url = page.url
+            ok = await page.evaluate(CLICK_JS, n - 1)
+            if not ok:
+                await load_list(page)
+                ok = await page.evaluate(CLICK_JS, n - 1)
+            target = None
+            for _ in range(30):                       # wait up to ~6s for a new tab or a URL change
+                await page.wait_for_timeout(200)
+                new = [p for p in ctx.pages if p not in before_pages]
+                if new:
+                    target = new[-1]
+                    break
+                if page.url != before_url:
+                    target = page
+                    break
+            if target is None:
+                log(f"[{n}] click fail: nothing opened")
+                continue
+            try:
+                await target.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+            data = await target.evaluate(EXTRACT_JS)
+            results.append({**row, **data, "href": target.url})
+            log(f"[{n}] ok (click) {target.url}")
+            if target is not page:
+                await target.close()
+            else:
+                await load_list(page)                 # back to the list for the next one
+        except Exception as e:
+            log(f"[{n}] click fail: {str(e)[:70]}")
+            try:
+                await load_list(page)
+            except Exception:
+                pass
+    await page.close()
 
 
 async def main():
@@ -110,21 +221,9 @@ async def main():
 
         # ---------- PHASE 1: collect the list (saved immediately) ----------
         try:
-            await page.goto(MAIN_URL, wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_timeout(1500)
-            await click_age_gate(page)
-            await page.wait_for_selector(THUMBS, timeout=15000, state="attached")
-
-            last = 0
-            for _ in range(15):
-                n = await page.locator(THUMBS).count()
-                if n >= HOW_MANY or n == last:
-                    break
-                last = n
-                await page.mouse.wheel(0, 5000)
-                await page.wait_for_timeout(400)
-
+            await load_list(page, first=True)
             info = await page.eval_on_selector_all(THUMBS, LIST_JS)
+            debug = await page.evaluate(DEBUG_JS)
         except Exception as e:
             log("ERROR on main page:", e)
             log("Page title:", await page.title())
@@ -137,20 +236,41 @@ async def main():
             return []
 
         info = info[:HOW_MANY]
-        rows = [{"n": i + 1, **x} for i, x in enumerate(info)]
+        rows = []
+        for i, x in enumerate(info):
+            x["href"] = good_link(x["href"])
+            rows.append({"n": i + 1, **x})
         save(rows, "list")
-        linked = [r for r in rows if r["href"]]
-        log(f"PHASE 1 done in {time.time()-t0:.0f}s: {len(rows)} thumbnails, {len(linked)} with links -> output/list.csv")
+        linked   = [r for r in rows if r["href"]]
+        unlinked = [r for r in rows if not r["href"]]
+        log(f"PHASE 1 done in {time.time()-t0:.0f}s: {len(rows)} thumbnails, "
+            f"{len(linked)} with links, {len(unlinked)} without -> output/list.csv")
+        if rows:
+            log("First 3 rows:")
+            for r in rows[:3]:
+                log("  ", r["n"], (r["alt"] or "")[:50], "|", r["href"], "|", (r["src"] or "")[:80])
+        if unlinked and debug:
+            log("Thumbnail HTML (child -> parents) for debugging:")
+            for d in debug:
+                log("  ", d.replace("\n", " "))
         await page.close()
 
-        # ---------- PHASE 2: details in parallel ----------
+        # ---------- PHASE 2: details ----------
         results = []
-        if not SKIP_DETAILS and linked:
-            sem = asyncio.Semaphore(CONCURRENCY)
-            await asyncio.gather(*(scrape_link(ctx, sem, r, results) for r in linked))
+        if not SKIP_DETAILS:
+            await ctx.route("**/*", route_light)
+            tasks = []
+            if linked:
+                sem = asyncio.Semaphore(CONCURRENCY)
+                tasks += [scrape_link(ctx, sem, r, results) for r in linked]
+            if unlinked:
+                k = max(1, min(CLICK_WORKERS, len(unlinked)))
+                for w in range(k):
+                    tasks.append(click_worker(ctx, w + 1, unlinked[w::k], results))
+            await asyncio.gather(*tasks)
             results.sort(key=lambda r: r["n"])
             save(results, "results")
-            log(f"PHASE 2 done in {time.time()-t0:.0f}s: {len(results)}/{len(linked)} pages scraped")
+            log(f"PHASE 2 done in {time.time()-t0:.0f}s: {len(results)}/{len(rows)} pages scraped -> output/results.csv")
 
         await browser.close()
     return rows

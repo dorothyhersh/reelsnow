@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
       how_many:
-        description: "How many items per main URL"
+        description: "Max items per main URL"
         required: false
         default: "500"
   # Uncomment to run automatically every day at 02:00 UTC:
@@ -23,7 +23,7 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
 
@@ -33,9 +33,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright openpyxl
+          pip install playwright openpyxl requests
           curl -fsSL https://rclone.org/install.sh | sudo bash
           google-chrome --version
+          ffmpeg -version | head -1 || echo "ffmpeg not found (only needed for .m3u8 videos)"
 
       - name: Configure rclone for Mega
         env:
@@ -58,7 +59,8 @@ jobs:
         env:
           MAIN_URLS: ${{ github.event.inputs.main_urls }}
           HOW_MANY: ${{ github.event.inputs.how_many || '500' }}
-          CONCURRENCY: "8"
-          CLICK_WORKERS: "4"
+          MEGA_DIR: reelsnow
+          CONCURRENCY: "6"
+          CHUNK: "30"
           PYTHONUNBUFFERED: "1"
         run: python -u scrape.py

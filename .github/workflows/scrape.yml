@@ -3,22 +3,32 @@ name: Scrape
 on:
   workflow_dispatch:
     inputs:
-      main_url:
-        description: "Page to scrape"
+      main_urls:
+        description: "Main URLs, comma-separated (leave empty to use main_urls.txt)"
         required: false
-        default: "https://www.shorts.xxx/user/teressa/"
+        default: ""
       how_many:
-        description: "How many items"
+        description: "How many items per main URL"
         required: false
         default: "75"
   # Uncomment to run automatically every day at 02:00 UTC:
   # schedule:
   #   - cron: "0 2 * * *"
 
+# Never run two scrapes at once: they would overwrite each other's files on Mega.
+concurrency:
+  group: scrape-mega
+  cancel-in-progress: false
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
+    env:
+      # rclone "mega" remote, built from GitHub Secrets (no password stored in the repo)
+      RCLONE_CONFIG_MEGA_TYPE: mega
+      RCLONE_CONFIG_MEGA_USER: ${{ secrets.MEGA_USER }}
+      RCLONE_CONFIG_MEGA_PASS: ${{ secrets.MEGA_PASS }}
     steps:
       - uses: actions/checkout@v4
 
@@ -28,22 +38,15 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright
+          pip install playwright openpyxl
           playwright install --with-deps chromium
+          curl -fsSL https://rclone.org/install.sh | sudo bash
 
       - name: Run scraper
         env:
-          MAIN_URL: ${{ github.event.inputs.main_url || 'https://www.shorts.xxx/user/teressa/' }}
+          MAIN_URLS: ${{ github.event.inputs.main_urls }}
           HOW_MANY: ${{ github.event.inputs.how_many || '75' }}
           CONCURRENCY: "8"
-          SKIP_DETAILS: "0"
+          CLICK_WORKERS: "4"
           PYTHONUNBUFFERED: "1"
         run: python -u scrape.py
-
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scrape-results
-          path: output/
-          if-no-files-found: warn

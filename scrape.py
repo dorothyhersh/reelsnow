@@ -5,12 +5,16 @@ from playwright.async_api import async_playwright
 
 HOW_MANY      = int(os.environ.get("HOW_MANY", "75"))        # items per main URL
 CONCURRENCY   = int(os.environ.get("CONCURRENCY", "8"))      # parallel tabs for pages that have links
-CLICK_WORKERS = int(os.environ.get("CLICK_WORKERS", "4"))    # parallel tabs for click-by-index
+CLICK_WORKERS = int(os.environ.get("CLICK_WORKERS", "4"))    # parallel workers for click-by-index
 REMOTE        = os.environ.get("MEGA_REMOTE", "mega:")       # rclone remote (root folder of Mega)
 SEEN_FILE     = "already_downloaded_urls_reels.txt"
 XLSX_FILE     = "results.xlsx"
 OUT           = "output"
 os.makedirs(OUT, exist_ok=True)
+
+VIEWPORT = {"width": 430, "height": 900}
+USER_AGENT = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36")
 
 AGE_SELECTORS = [
     "text=/I\\s*am\\s*18\\+?/i", "text=/I\\s*am\\s*over\\s*18/i", "text=/18\\+/",
@@ -72,6 +76,11 @@ def norm(u):
     return u.split("#")[0].rstrip("/")
 
 
+def is_root(u):
+    """https://www.shorts.xxx/ is never a reel."""
+    return urlparse(u).path.strip("/") == ""
+
+
 def tab_name(url):
     """Tab name from the main URL: ?search=mama+feed -> mamafeed, /user/teressa/ -> teressa"""
     u = urlparse(url)
@@ -118,7 +127,7 @@ def rclone(*args):
 
 
 def mega_pull():
-    # If listing fails we STOP, so a network/login problem can never overwrite the saved list.
+    # If listing fails we STOP, so a network/login problem can never overwrite the saved files.
     remote_files = set(rclone("lsf", REMOTE, "--files-only").splitlines())
     for name in (SEEN_FILE, XLSX_FILE):
         if name in remote_files:
@@ -135,16 +144,15 @@ def persist(wb, seen_list):
     # sheet first, then the url list: if something breaks in between we get a duplicate, never a lost row
     rclone("copyto", f"{OUT}/{XLSX_FILE}", REMOTE + XLSX_FILE)
     rclone("copyto", f"{OUT}/{SEEN_FILE}", REMOTE + SEEN_FILE)
-    log("Uploaded results.xlsx and already_downloaded_urls_reels.txt to Mega")
+    log(f"Uploaded to Mega: results.xlsx + {SEEN_FILE} ({len(seen_list)} urls)")
 
 
-def load_seen():
+def read_txt():
     path = f"{OUT}/{SEEN_FILE}"
-    seen_list = []
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            seen_list = [l.strip() for l in f if l.strip()]
-    return seen_list, {norm(u) for u in seen_list}
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [l.strip() for l in f if l.strip()]
 
 
 def load_wb():
@@ -154,6 +162,17 @@ def load_wb():
     wb = Workbook()
     wb.remove(wb.active)
     return wb
+
+
+def sheet_urls(wb):
+    """Every final_url really saved in the sheet (all tabs). This is the truth for duplicate checks."""
+    out = []
+    for ws in wb.worksheets:
+        for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
+            v = row[0]
+            if isinstance(v, str) and v.strip().startswith("http") and not is_root(v.strip()):
+                out.append(v.strip())
+    return out
 
 
 def get_ws(wb, name):
@@ -168,6 +187,21 @@ def get_ws(wb, name):
 
 
 # ------------------------------------------------------------------ browser helpers
+async def route_handler(route):
+    if BLOCK and route.request.resource_type in ("image", "media", "font"):
+        await route.abort()
+    else:
+        await route.continue_()
+
+
+async def make_ctx(browser, cookies=None):
+    ctx = await browser.new_context(viewport=VIEWPORT, user_agent=USER_AGENT)
+    await ctx.route("**/*", route_handler)
+    if cookies:
+        await ctx.add_cookies(cookies)
+    return ctx
+
+
 async def click_age_gate(page, quick=False):
     for sel in AGE_SELECTORS:
         try:
@@ -180,13 +214,6 @@ async def click_age_gate(page, quick=False):
         except Exception:
             pass
     return False
-
-
-async def route_handler(route):
-    if BLOCK and route.request.resource_type in ("image", "media", "font"):
-        await route.abort()
-    else:
-        await route.continue_()
 
 
 async def scroll_all(page, sel):
@@ -228,12 +255,14 @@ def good_link(h, main_url):
 
 
 def add_result(job, n, data):
-    """Keep a result only if it is a real new reel page. Returns True when added."""
+    """Keep a result only if it is a real, new reel page. Returns True when added."""
     fu = (data.get("final_url") or "").strip()
     title = clean_cell(data.get("title"))
     if not fu.startswith("http") or not title:
         return False
-    if norm(fu) == norm(job["main"]) or norm(fu) in job["seen"]:
+    if is_root(fu) or "/vast_" in fu or norm(fu) == norm(job["main"]):
+        return False
+    if norm(fu) in job["seen"]:
         return False
     job["seen"].add(norm(fu))                 # no await between check and add, so this is safe
     job["bucket"].append((n, fu, title))
@@ -249,26 +278,28 @@ async def scrape_link(ctx, sem, row, job):
             if not data["title"] and await click_age_gate(pg, quick=True):
                 data = await pg.evaluate(EXTRACT_JS)
             ok = add_result(job, row["n"], data)
-            log(f"[{row['n']}] {'new ' if ok else 'skip'} {row['href']}")
+            log(f"[{row['n']}] {'NEW ' if ok else 'skip'} {row['href']}")
         except Exception as e:
             log(f"[{row['n']}] fail {row['href']}: {str(e)[:70]}")
         finally:
             await pg.close()
 
 
-async def click_worker(ctx, wid, job, rows):
-    """Thumbnails with no link: click by index, read the page that opens, come back."""
-    page = await ctx.new_page()
+async def click_worker(browser, cookies, wid, job, rows):
+    """Thumbnails with no link: click by index, read the page that opens, come back.
+    Each worker has its OWN browser context, so workers can never touch each other's tabs."""
+    wctx = await make_ctx(browser, cookies)
+    page = await wctx.new_page()
     try:
         sel = await load_list(page, job["main"])
     except Exception as e:
         log(f"[worker {wid}] cannot load list: {str(e)[:80]}")
-        await page.close()
+        await wctx.close()
         return
     for row in rows:
         n = row["n"]
         try:
-            before_pages = set(ctx.pages)
+            before_pages = set(wctx.pages)
             before_url = page.url
             ok = await page.evaluate(CLICK_JS, [sel, n - 1])
             if not ok:
@@ -277,7 +308,7 @@ async def click_worker(ctx, wid, job, rows):
             target = None
             for _ in range(30):                      # wait up to ~6s for a new tab or URL change
                 await page.wait_for_timeout(200)
-                new = [p for p in ctx.pages if p not in before_pages]
+                new = [p for p in wctx.pages if p not in before_pages]
                 if new:
                     target = new[-1]
                     break
@@ -293,7 +324,7 @@ async def click_worker(ctx, wid, job, rows):
                 pass
             data = await target.evaluate(EXTRACT_JS)
             added = add_result(job, n, data)
-            log(f"[{n}] {'new ' if added else 'skip'} (click) {target.url}")
+            log(f"[{n}] {'NEW ' if added else 'skip'} (click) {target.url}")
             if target is not page:
                 await target.close()
             else:
@@ -304,11 +335,11 @@ async def click_worker(ctx, wid, job, rows):
                 sel = await load_list(page, job["main"])
             except Exception:
                 pass
-    await page.close()
+    await wctx.close()
 
 
-async def scrape_main(ctx, main_url, seen):
-    """Returns the list of NEW (n, final_url, title) found on one main URL."""
+async def scrape_main(browser, ctx, main_url, seen):
+    """Scrapes ONE main URL. Returns the list of NEW (n, final_url, title) for that URL only."""
     global BLOCK
     BLOCK = False
     bucket = []
@@ -328,16 +359,19 @@ async def scrape_main(ctx, main_url, seen):
             pass
         await page.close()
         raise
+    cookies = await ctx.cookies()
     await page.close()
 
     info = info[:HOW_MANY]
     rows = [{"n": i + 1, "href": good_link(x["href"], main_url)} for i, x in enumerate(info)]
+    ads      = [r for r in rows if r["href"] and "/vast_" in r["href"]]     # ad tiles, never reels
+    rows     = [r for r in rows if not (r["href"] and "/vast_" in r["href"])]
     linked   = [r for r in rows if r["href"]]
     unlinked = [r for r in rows if not r["href"]]
     skipped  = [r for r in linked if norm(r["href"]) in seen]
     linked   = [r for r in linked if norm(r["href"]) not in seen]
-    log(f"Selector '{sel}': {len(rows)} thumbnails | {len(linked)} new links, "
-        f"{len(skipped)} already saved, {len(unlinked)} need click")
+    log(f"Selector '{sel}': {len(info)} thumbnails | {len(linked)} new links, "
+        f"{len(skipped)} already saved, {len(unlinked)} need click, {len(ads)} ads ignored")
     if unlinked and debug:
         log("Thumbnail HTML (child -> parents) for debugging:")
         for d in debug:
@@ -352,7 +386,7 @@ async def scrape_main(ctx, main_url, seen):
         if unlinked:
             k = max(1, min(CLICK_WORKERS, len(unlinked)))
             for w in range(k):
-                tasks.append(click_worker(ctx, w + 1, job, unlinked[w::k]))
+                tasks.append(click_worker(browser, cookies, w + 1, job, unlinked[w::k]))
         await asyncio.gather(*tasks)
     finally:
         BLOCK = False
@@ -369,39 +403,55 @@ async def main():
     log(f"{len(urls)} main URL(s)")
 
     mega_pull()
-    seen_list, seen = load_seen()
     wb = load_wb()
-    log(f"Already saved URLs: {len(seen_list)}")
+
+    # What is REALLY saved = the rows in the sheet. The txt is rebuilt from it, so the two can never drift apart.
+    seen, seen_list = set(), []
+    for u in sheet_urls(wb):
+        if norm(u) not in seen:
+            seen.add(norm(u))
+            seen_list.append(u)
+    txt_urls = [u for u in read_txt() if not is_root(u)]
+    txt_only = [u for u in txt_urls if norm(u) not in seen]
+    log(f"Sheet rows saved: {len(seen_list)} | urls in txt: {len(txt_urls)}")
+    for ws in wb.worksheets:
+        log(f"  tab '{ws.title}': {max(ws.max_row - 1, 0)} rows")
+    if txt_only:
+        log(f"{len(txt_only)} urls were in the txt but NOT in the sheet -> they will be scraped again and saved properly")
+    dirty = bool(txt_only) or len(read_txt()) != len(seen_list)   # txt needs a clean-up upload
 
     ok_count, total_new = 0, 0
     async with async_playwright() as p:
         # uses the Google Chrome already installed on GitHub runners (no browser download needed)
         browser = await p.chromium.launch(
             channel="chrome", headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        ctx = await browser.new_context(
-            viewport={"width": 430, "height": 900},
-            user_agent=("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"))
-        await ctx.route("**/*", route_handler)
+        ctx = await make_ctx(browser)
 
-        for main_url in urls:
+        for main_url in urls:                      # one main URL at a time: scrape -> save -> next
             tab = tab_name(main_url)
             log(f"\n=== {main_url}  ->  tab '{tab}' ===")
             try:
-                new_rows = await scrape_main(ctx, main_url, seen)
+                new_rows = await scrape_main(browser, ctx, main_url, seen)
             except Exception as e:
                 log(f"Skipped this URL: {str(e)[:120]}")
                 continue
             ok_count += 1
+            created = tab not in wb.sheetnames
             ws = get_ws(wb, tab)
             for _, fu, title in new_rows:
                 ws.append([fu, title])
                 seen_list.append(fu)
             total_new += len(new_rows)
-            log(f"{len(new_rows)} new rows -> tab '{tab}'")
-            if new_rows:
-                persist(wb, seen_list)       # upload after every main URL, so progress is never lost
+            log(f"{len(new_rows)} new rows -> tab '{tab}' (tab now has {max(ws.max_row - 1, 0)} rows)")
+            if new_rows or created:
+                dirty = True
+            if dirty:
+                persist(wb, seen_list)             # upload before starting the next main URL
+                dirty = False
         await browser.close()
+
+    if dirty and wb.sheetnames:
+        persist(wb, seen_list)
 
     log(f"\nDone in {time.time()-t0:.0f}s: {total_new} new reels, {ok_count}/{len(urls)} main URLs worked")
     return 0 if ok_count else 1

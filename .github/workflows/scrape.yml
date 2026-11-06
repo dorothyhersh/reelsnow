@@ -24,11 +24,6 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    env:
-      # rclone "mega" remote, built from GitHub Secrets (no password stored in the repo)
-      RCLONE_CONFIG_MEGA_TYPE: mega
-      RCLONE_CONFIG_MEGA_USER: ${{ secrets.MEGA_USER }}
-      RCLONE_CONFIG_MEGA_PASS: ${{ secrets.MEGA_PASS }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,6 +36,23 @@ jobs:
           pip install playwright openpyxl
           playwright install --with-deps chromium
           curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone for Mega
+        env:
+          MEGA_CONFIG: ${{ secrets.MEGA_CONFIG }}
+        run: |
+          # MEGA_CONFIG secret = the whole [mega] block (type / user / pass in plain text)
+          MUSER=$(printf '%s\n' "$MEGA_CONFIG" | sed -n 's/^[[:space:]]*user[[:space:]]*=[[:space:]]*//p' | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')
+          MPASS=$(printf '%s\n' "$MEGA_CONFIG" | sed -n 's/^[[:space:]]*pass[[:space:]]*=[[:space:]]*//p' | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')
+          if [ -z "$MUSER" ] || [ -z "$MPASS" ]; then
+            echo "MEGA_CONFIG secret is missing or has no user/pass lines"; exit 1
+          fi
+          echo "::add-mask::$MPASS"
+          OBSCURED=$(rclone obscure "$MPASS")
+          echo "::add-mask::$OBSCURED"
+          mkdir -p ~/.config/rclone
+          printf '[mega]\ntype = mega\nuser = %s\npass = %s\n' "$MUSER" "$OBSCURED" > ~/.config/rclone/rclone.conf
+          rclone lsd mega: >/dev/null && echo "Mega login OK"
 
       - name: Run scraper
         env:

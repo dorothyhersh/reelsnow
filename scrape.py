@@ -1,18 +1,22 @@
-import os, re, sys, asyncio, time, subprocess
+import os, re, sys, asyncio, time, subprocess, threading
 from urllib.parse import urlparse, parse_qs, unquote
+import requests
 from openpyxl import Workbook, load_workbook
 from playwright.async_api import async_playwright
 
 HOW_MANY      = int(os.environ.get("HOW_MANY", "500"))       # max items per main URL
-CONCURRENCY   = int(os.environ.get("CONCURRENCY", "8"))      # parallel tabs for pages that have links
-CLICK_WORKERS = int(os.environ.get("CLICK_WORKERS", "4"))    # parallel workers for click-by-index
+CONCURRENCY   = int(os.environ.get("CONCURRENCY", "6"))      # reels handled at the same time
+CHUNK         = int(os.environ.get("CHUNK", "30"))           # download + upload + save in groups of this size
+MEGA_DIR      = os.environ.get("MEGA_DIR", "reelsnow")       # folder on Mega that receives the video files
 REMOTE        = os.environ.get("MEGA_REMOTE", "mega:")       # rclone remote (root folder of Mega)
 SEEN_FILE     = "already_downloaded_urls_reels.txt"
 XLSX_FILE     = "results.xlsx"
-OUT           = "output"
-os.makedirs(OUT, exist_ok=True)
+OUT, DL_DIR, TMP_DIR = "output", "downloads", "tmp_dl"
+for _d in (OUT, DL_DIR, TMP_DIR):
+    os.makedirs(_d, exist_ok=True)
 
-VIEWPORT = {"width": 430, "height": 900}
+HEADERS    = ["filename", "title", "final_url"]
+VIEWPORT   = {"width": 430, "height": 900}
 USER_AGENT = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36")
 
@@ -21,10 +25,11 @@ AGE_SELECTORS = [
     "text=/\\b(enter|agree|accept|continue|yes)\\b/i",
     "button:has-text('18')", "a:has-text('18')",
 ]
-# tried in order; the first one that matches on the page is used
+# most specific first: the first one that matches on the page is used
 SELECTORS = [".imgprev[onclick*='jumptoid'] img.lazyload",   # reel tiles only (jumptoid / jumptoid2)
              ".imgprev img.lazyload", ".profileside img.lazyload", "img.lazyload"]
 
+# One entry per thumbnail: the reel link (<a>, data-*, or the id inside onclick="jumptoid(203433,..)")
 LIST_JS = """els => els.map(e => {
   const abs = u => { try { return new URL(u, location.href).href; } catch (_) { return null; } };
   let href = null, node = e;
@@ -35,7 +40,7 @@ LIST_JS = """els => els.map(e => {
     if (key) { href = abs(d[key]); break; }
     const oc = node.getAttribute('onclick');
     if (oc) {
-      const pid = oc.match(/jumptoid2?[(][ ]*([0-9]+)/);            // jumptoid(203433,'',0) -> /post/203433
+      const pid = oc.match(/jumptoid2?[(][ ]*([0-9]+)/);
       if (pid) { href = location.origin + '/post/' + pid[1]; break; }
       const m = oc.match(/['"]([^'"]+)['"]/); if (m) { href = abs(m[1]); break; }
     }
@@ -47,21 +52,25 @@ LIST_JS = """els => els.map(e => {
   return { alt: e.alt, href: href };
 })"""
 
-DEBUG_JS = """sel => {
-  const e = document.querySelector(sel);
-  if (!e) return null;
-  const out = []; let n = e;
-  for (let k = 0; k < 3 && n && n !== document.body; k++, n = n.parentElement) out.push(n.outerHTML.slice(0, 400));
-  return out;
-}"""
-
-CLICK_JS = """([sel, i]) => {
-  const img = document.querySelectorAll(sel)[i];
-  if (!img) return false;
-  img.scrollIntoView({block: 'center'});
-  const a = img.closest('a');
-  (a || img).click();
-  return true;
+# Scrolls the last thumbnail into view AND every scrollable container around it, and fires scroll events
+SCROLL_JS = """sel => {
+  const imgs = document.querySelectorAll(sel);
+  const last = imgs[imgs.length - 1];
+  if (last) last.scrollIntoView({block: 'end'});
+  let p = last ? last.parentElement : null;
+  while (p) {
+    const oy = getComputedStyle(p).overflowY;
+    if ((oy === 'auto' || oy === 'scroll') && p.scrollHeight > p.clientHeight) {
+      p.scrollTop = p.scrollHeight; p.dispatchEvent(new Event('scroll'));
+    }
+    p = p.parentElement;
+  }
+  for (const s of ['#contentblock', '.rightside', '.rightsideinner', '.profileside']) {
+    const el = document.querySelector(s);
+    if (el && el.scrollHeight > el.clientHeight) { el.scrollTop = el.scrollHeight; el.dispatchEvent(new Event('scroll')); }
+  }
+  window.scrollTo(0, document.documentElement.scrollHeight);
+  window.dispatchEvent(new Event('scroll'));
 }"""
 
 EXTRACT_JS = """() => ({
@@ -69,26 +78,61 @@ EXTRACT_JS = """() => ({
   title: (document.title || (document.querySelector('h1') || {}).innerText || '').trim()
 })"""
 
-BLOCK = False   # True while scraping detail pages: skips images / media / fonts for speed
+# Every place on a reel page where the video file address can hide
+VIDEO_JS = """() => {
+  const out = [];
+  const add = (u, kind) => {
+    if (!u || u.startsWith('blob:') || u.startsWith('data:') || u.startsWith('javascript:')) return;
+    try { out.push({url: new URL(u, location.href).href, kind: kind}); } catch (_) {}
+  };
+  document.querySelectorAll('a[download]').forEach(a => add(a.getAttribute('href'), 'dlattr'));
+  document.querySelectorAll('a[href]').forEach(a => {
+    const t = (a.innerText || '').trim();
+    const h = a.getAttribute('href') || '';
+    if (/^download/i.test(t) || /download/i.test(h)) add(h, 'dltext');
+  });
+  document.querySelectorAll('video').forEach(v => {
+    add(v.currentSrc, 'video'); add(v.getAttribute('src'), 'video');
+    v.querySelectorAll('source').forEach(s => add(s.getAttribute('src'), 'video'));
+  });
+  for (const n of ['og:video', 'og:video:url', 'og:video:secure_url', 'twitter:player:stream']) {
+    const m = document.querySelector('meta[property="' + n + '"],meta[name="' + n + '"]');
+    if (m) add(m.content, 'meta');
+  }
+  return out;
+}"""
+
+DEBUG_VIDEO_JS = """() => {
+  const v = document.querySelector('video');
+  const links = Array.from(document.querySelectorAll('a')).map(a =>
+    (a.innerText || '').trim().slice(0, 25) + ' | ' + (a.getAttribute('href') || '').slice(0, 70))
+    .filter(s => /download|mp4|video/i.test(s)).slice(0, 6);
+  return { video_tag: v ? v.outerHTML.slice(0, 500) : null, links: links };
+}"""
+
+BLOCK = False            # True while opening reel pages: skips images / media / fonts for speed
+USED_NAMES = set()       # filenames already used (sheet + this run), so nothing is overwritten
+NAME_LOCK = threading.Lock()
+DEBUG_SHOWN = 0
 
 
 def log(*a):
     print(*a, flush=True)
 
 
-# ------------------------------------------------------------------ helpers
+# ------------------------------------------------------------------ small helpers
 def norm(u):
     return u.split("#")[0].rstrip("/")
-
-
-def is_root(u):
-    """https://www.shorts.xxx/ is never a reel."""
-    return urlparse(u).path.strip("/") == ""
 
 
 def is_reel_url(u):
     """A real reel page looks like https://www.shorts.xxx/post/208305 (creator pages are /user/..., never saved)."""
     return re.fullmatch(r"/post/\d+/?", urlparse(u).path) is not None
+
+
+def post_id(u):
+    m = re.search(r"/post/(\d+)", u)
+    return m.group(1) if m else "x"
 
 
 def tab_name(url):
@@ -128,6 +172,11 @@ def get_main_urls():
     return urls
 
 
+def chunks(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
 # ------------------------------------------------------------------ mega (rclone)
 def rclone(*args):
     r = subprocess.run(["rclone", *args], capture_output=True, text=True)
@@ -147,22 +196,48 @@ def mega_pull():
             log(f"{name} is not on Mega yet - a new one will be created")
 
 
-def persist(wb, seen_list):
-    wb.save(f"{OUT}/{XLSX_FILE}")
-    with open(f"{OUT}/{SEEN_FILE}", "w", encoding="utf-8") as f:
-        f.write("\n".join(seen_list) + "\n")
-    # sheet first, then the url list: if something breaks in between we get a duplicate, never a lost row
-    rclone("copyto", f"{OUT}/{XLSX_FILE}", REMOTE + XLSX_FILE)
-    rclone("copyto", f"{OUT}/{SEEN_FILE}", REMOTE + SEEN_FILE)
-    log(f"Uploaded to Mega: results.xlsx + {SEEN_FILE} ({len(seen_list)} urls)")
+def upload_downloads():
+    """Moves every finished video in downloads/ to Mega folder 'reelsnow'. Files that fail stay in downloads/."""
+    files = os.listdir(DL_DIR)
+    if not files:
+        return
+    log(f"Uploading {len(files)} video file(s) to Mega folder '{MEGA_DIR}' ...")
+    r = subprocess.run(
+        ["rclone", "move", DL_DIR, f"{REMOTE}{MEGA_DIR}", "--transfers", "3",
+         "--retries", "3", "--low-level-retries", "8"],
+        capture_output=True, text=True)
+    left = os.listdir(DL_DIR)
+    if r.returncode != 0 or left:
+        log(f"  upload problem (rc={r.returncode}): {len(left)} file(s) NOT uploaded. {r.stderr.strip()[-300:]}")
+    else:
+        log("  upload OK")
 
 
-def read_txt():
-    path = f"{OUT}/{SEEN_FILE}"
-    if not os.path.exists(path):
-        return []
-    with open(path, encoding="utf-8") as f:
-        return [l.strip() for l in f if l.strip()]
+def uploaded_name(res):
+    """The filename, but only if that file really left downloads/ (= it reached Mega)."""
+    fn = (res or {}).get("filename")
+    if fn and not os.path.exists(os.path.join(DL_DIR, fn)):
+        return fn
+    return ""
+
+
+# ------------------------------------------------------------------ workbook: filename | title | final_url
+def style_ws(ws):
+    ws.column_dimensions["A"].width = 50
+    ws.column_dimensions["B"].width = 70
+    ws.column_dimensions["C"].width = 60
+    ws.freeze_panes = "A2"
+
+
+def new_ws(wb, name, index=None):
+    ws = wb.create_sheet(name, index) if index is not None else wb.create_sheet(name)
+    ws.append(HEADERS)
+    style_ws(ws)
+    return ws
+
+
+def get_ws(wb, name):
+    return wb[name] if name in wb.sheetnames else new_ws(wb, name)
 
 
 def load_wb():
@@ -174,38 +249,186 @@ def load_wb():
     return wb
 
 
-def sheet_urls(wb):
-    """Every final_url really saved in the sheet (all tabs). This is the truth for duplicate checks."""
-    out = []
-    for ws in wb.worksheets:
-        for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
-            v = row[0]
-            if isinstance(v, str) and v.strip().startswith("http") and is_reel_url(v.strip()):
-                out.append(v.strip())
-    return out
+def migrate_wb(wb):
+    """Old tabs had  final_url | title.  Convert them to  filename | title | final_url (filename empty = not downloaded yet)."""
+    n = 0
+    for ws in list(wb.worksheets):
+        head = [c.value for c in ws[1]][:2] if ws.max_row >= 1 else []
+        if head == ["final_url", "title"]:
+            old = [(r[0], r[1]) for r in ws.iter_rows(min_row=2, max_col=2, values_only=True) if r and r[0]]
+            title, idx = ws.title, wb.sheetnames.index(ws.title)
+            wb.remove(ws)
+            new = new_ws(wb, title, idx)
+            for fu, t in old:
+                new.append(["", clean_cell(str(t or "")), str(fu).strip()])
+            n += 1
+    return n
 
 
 def purge_bad_rows(wb):
-    """Deletes rows saved by mistake whose URL is not a reel page (creator links, home page, ads)."""
+    """Deletes rows whose URL is not a reel page (creator links, home page, ads) - saved there by mistake earlier."""
     removed = 0
     for ws in wb.worksheets:
         for r in range(ws.max_row, 1, -1):
-            v = ws.cell(row=r, column=1).value
+            v = ws.cell(row=r, column=3).value
             if isinstance(v, str) and v.strip().startswith("http") and not is_reel_url(v.strip()):
                 ws.delete_rows(r)
                 removed += 1
     return removed
 
 
-def get_ws(wb, name):
-    if name in wb.sheetnames:
-        return wb[name]
-    ws = wb.create_sheet(name)
-    ws.append(["final_url", "title"])
-    ws.column_dimensions["A"].width = 70
-    ws.column_dimensions["B"].width = 70
-    ws.freeze_panes = "A2"
-    return ws
+def scan(wb):
+    """saved: every reel url in the sheet.  pending: rows that have no downloaded file yet."""
+    saved, pending = {}, []
+    for ws in wb.worksheets:
+        for r in range(2, ws.max_row + 1):
+            url = ws.cell(row=r, column=3).value
+            if not (isinstance(url, str) and is_reel_url(url.strip())):
+                continue
+            url = url.strip()
+            k = norm(url)
+            if k in saved:
+                continue
+            saved[k] = url
+            fn = ws.cell(row=r, column=1).value
+            if not (isinstance(fn, str) and fn.strip()):
+                pending.append((ws, r, url))
+    return saved, pending
+
+
+def sheet_filenames(wb):
+    out = set()
+    for ws in wb.worksheets:
+        for r in range(2, ws.max_row + 1):
+            fn = ws.cell(row=r, column=1).value
+            if isinstance(fn, str) and fn.strip():
+                out.add(fn.strip())
+    return out
+
+
+def downloaded_urls(wb):
+    out, seen = [], set()
+    for ws in wb.worksheets:
+        for r in range(2, ws.max_row + 1):
+            fn = ws.cell(row=r, column=1).value
+            url = ws.cell(row=r, column=3).value
+            if isinstance(fn, str) and fn.strip() and isinstance(url, str) and is_reel_url(url.strip()):
+                k = norm(url.strip())
+                if k not in seen:
+                    seen.add(k)
+                    out.append(url.strip())
+    return out
+
+
+def persist(wb):
+    if not wb.sheetnames:
+        return
+    wb.save(f"{OUT}/{XLSX_FILE}")
+    urls = downloaded_urls(wb)
+    with open(f"{OUT}/{SEEN_FILE}", "w", encoding="utf-8") as f:
+        f.write("\n".join(urls) + ("\n" if urls else ""))
+    # sheet first, then the url list: if something breaks in between we re-check a reel, never lose a row
+    rclone("copyto", f"{OUT}/{XLSX_FILE}", REMOTE + XLSX_FILE)
+    rclone("copyto", f"{OUT}/{SEEN_FILE}", REMOTE + SEEN_FILE)
+    log(f"Saved to Mega: {XLSX_FILE} + {SEEN_FILE} ({len(urls)} downloaded reels)")
+
+
+# ------------------------------------------------------------------ downloading
+def default_filename(headers, url, content_type):
+    """The name the browser would give the file: Content-Disposition first, else the last part of the URL."""
+    cd = headers.get("Content-Disposition", "") or ""
+    name = ""
+    m = re.search(r"filename\*\s*=\s*(?:UTF-8'')?([^;]+)", cd, re.I)
+    if m:
+        name = unquote(m.group(1).strip().strip('"'))
+    else:
+        m = re.search(r'filename\s*=\s*"?([^";]+)"?', cd, re.I)
+        if m:
+            name = m.group(1).strip()
+    if not name:
+        name = unquote(os.path.basename(urlparse(url).path))
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip(" .")
+    if not name:
+        name = "video"
+    if not os.path.splitext(name)[1]:
+        ct = (content_type or "").split(";")[0].strip().lower()
+        name += {"video/webm": ".webm", "video/quicktime": ".mov"}.get(ct, ".mp4")
+    return name
+
+
+def unique_name(name, pid):
+    """Keeps the default name. Only if that exact name is already taken, the reel id is added before the extension."""
+    with NAME_LOCK:
+        if name in USED_NAMES:
+            stem, ext = os.path.splitext(name)
+            name = f"{stem}_{pid}{ext}"
+        USED_NAMES.add(name)
+    return name
+
+
+def http_download(url, referer):
+    ref_host = (urlparse(referer).hostname or "").replace("www.", "")
+    headers = {"User-Agent": USER_AGENT, "Referer": referer, "Accept": "*/*"}
+    with requests.get(url, headers=headers, stream=True, timeout=(15, 90)) as r:
+        r.raise_for_status()
+        ct = r.headers.get("Content-Type", "")
+        if ct.lower().startswith(("text/", "application/json")):
+            raise RuntimeError(f"not a video file ({ct})")
+        name = default_filename(r.headers, url, ct)
+        tmp = os.path.join(TMP_DIR, f"{threading.get_ident()}_{name}.part")
+        size = 0
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
+                size += len(chunk)
+    if size == 0:
+        raise RuntimeError("empty file")
+    return tmp, name
+
+
+def ffmpeg_download(url, referer):
+    """For .m3u8 playlists: ffmpeg joins the pieces into one mp4 (ffmpeg is preinstalled on GitHub runners)."""
+    base = unquote(os.path.basename(urlparse(url).path)) or "video"
+    name = os.path.splitext(base)[0] + ".mp4"
+    tmp = os.path.join(TMP_DIR, f"{threading.get_ident()}_{name}.part.mp4")
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-headers", f"Referer: {referer}\r\nUser-Agent: {USER_AGENT}\r\n",
+         "-i", url, "-c", "copy", tmp],
+        check=True, timeout=900, capture_output=True)
+    return tmp, name
+
+
+def download_video(url, referer, pid):
+    if urlparse(url).path.lower().endswith(".m3u8"):
+        tmp, name = ffmpeg_download(url, referer)
+    else:
+        tmp, name = http_download(url, referer)
+    name = unique_name(name, pid)
+    os.replace(tmp, os.path.join(DL_DIR, name))
+    return name
+
+
+def pick_video(cands):
+    """Chooses the best video address: download button > <video> tag > meta tag > network request."""
+    best = None
+    for c in cands:
+        path = urlparse(c["url"]).path.lower()
+        if re.search(r"\.(jpe?g|png|gif|webp|svg|js|css|json|html?|ico|vtt|srt)$", path):
+            continue
+        vid_ext = re.search(r"\.(mp4|webm|mov|m4v|mkv)$", path) is not None
+        m3u8 = path.endswith(".m3u8")
+        kind = c["kind"]
+        if kind == "dltext" and not (vid_ext or m3u8):
+            score = 9                                    # a link that only says 'download' - last resort
+        else:
+            score = {"dlattr": 0, "video": 1, "meta": 2, "net": 3}.get(kind, 4)
+            if m3u8:
+                score += 5                               # prefer a plain file over a playlist
+        key = (score, 0 if vid_ext else 1)
+        if best is None or key < best[0]:
+            best = (key, c)
+    return best[1] if best else None
 
 
 # ------------------------------------------------------------------ browser helpers
@@ -216,11 +439,9 @@ async def route_handler(route):
         await route.continue_()
 
 
-async def make_ctx(browser, cookies=None):
+async def make_ctx(browser):
     ctx = await browser.new_context(viewport=VIEWPORT, user_agent=USER_AGENT)
     await ctx.route("**/*", route_handler)
-    if cookies:
-        await ctx.add_cookies(cookies)
     return ctx
 
 
@@ -238,29 +459,6 @@ async def click_age_gate(page, quick=False):
     return False
 
 
-# Scrolls the last thumbnail into view AND every scrollable container around it (the feed may scroll
-# inside its own box, not the window), and fires scroll events so the site's infinite-scroll code runs.
-SCROLL_JS = """sel => {
-  const imgs = document.querySelectorAll(sel);
-  const last = imgs[imgs.length - 1];
-  if (last) last.scrollIntoView({block: 'end'});
-  let p = last ? last.parentElement : null;
-  while (p) {
-    const oy = getComputedStyle(p).overflowY;
-    if ((oy === 'auto' || oy === 'scroll') && p.scrollHeight > p.clientHeight) {
-      p.scrollTop = p.scrollHeight; p.dispatchEvent(new Event('scroll'));
-    }
-    p = p.parentElement;
-  }
-  for (const s of ['#contentblock', '.rightside', '.rightsideinner', '.profileside']) {
-    const el = document.querySelector(s);
-    if (el && el.scrollHeight > el.clientHeight) { el.scrollTop = el.scrollHeight; el.dispatchEvent(new Event('scroll')); }
-  }
-  window.scrollTo(0, document.documentElement.scrollHeight);
-  window.dispatchEvent(new Event('scroll'));
-}"""
-
-
 async def click_load_more(page):
     for pat in ("load more", "show more", "view more", "see more"):
         try:
@@ -273,13 +471,12 @@ async def click_load_more(page):
     return False
 
 
-async def scroll_all(page, sel, need=None):
-    """Keep scrolling (and pressing 'load more') until no new thumbnails appear for 4 rounds in a row."""
-    need = need or HOW_MANY
+async def scroll_all(page, sel):
+    """Keep scrolling (and pressing 'load more') until no new thumbnails appear for 6 rounds in a row."""
     last, stable = 0, 0
     for _ in range(80):
         n = await page.locator(sel).count()
-        if n >= need:
+        if n >= HOW_MANY:
             break
         if n == last:
             stable += 1
@@ -293,14 +490,12 @@ async def scroll_all(page, sel, need=None):
             await page.evaluate(SCROLL_JS, sel)
         except Exception:
             pass
-        await page.mouse.move(215, 450)          # wheel events go to what is under the mouse
+        await page.mouse.move(215, 450)
         await page.mouse.wheel(0, 6000)
         await page.wait_for_timeout(1000)
-    return await page.locator(sel).count()
 
 
 async def pick_selector(page):
-    """Counts thumbnails for every candidate selector; returns the first (most specific) one that matches."""
     best, counts = None, {}
     for s in SELECTORS:
         n = await page.locator(s).count()
@@ -310,10 +505,10 @@ async def pick_selector(page):
     return best, counts
 
 
-async def load_list(page, main_url, first=False, need=None):
-    await page.goto(main_url, wait_until="domcontentloaded", timeout=45000 if first else 30000)
-    await page.wait_for_timeout(1500 if first else 500)
-    await click_age_gate(page, quick=not first)
+async def load_list(page, main_url):
+    await page.goto(main_url, wait_until="domcontentloaded", timeout=45000)
+    await page.wait_for_timeout(1500)
+    await click_age_gate(page)
     sel, counts = None, {}
     for _ in range(30):
         sel, counts = await pick_selector(page)
@@ -324,118 +519,21 @@ async def load_list(page, main_url, first=False, need=None):
         raise RuntimeError("no thumbnails found on the page")
     await page.wait_for_timeout(1500)            # let the main feed load before choosing
     sel, counts = await pick_selector(page)
-    await scroll_all(page, sel, need)
-    sel, counts = await pick_selector(page)      # the layout may have changed while scrolling
-    if first:
-        log(f"Thumbnails per selector: {counts}")
-        log(f"Scrolled the page: {counts[sel]} thumbnails loaded -> using '{sel}'")
+    await scroll_all(page, sel)
+    sel, counts = await pick_selector(page)
+    log(f"Thumbnails per selector: {counts}")
+    log(f"Scrolled the page: {counts[sel]} thumbnails loaded -> using '{sel}'")
     return sel
 
 
-def good_link(h, main_url):
-    if not h or not h.startswith("http"):
-        return None
-    if norm(h) == norm(main_url):
-        return None
-    return h
-
-
-def add_result(job, n, data):
-    """Keep a result only if it is a real, new reel page. Returns True when added."""
-    fu = (data.get("final_url") or "").strip()
-    title = clean_cell(data.get("title"))
-    if not fu.startswith("http") or not title:
-        return False
-    if not is_reel_url(fu) or norm(fu) == norm(job["main"]):
-        return False
-    if norm(fu) in job["seen"]:
-        return False
-    job["seen"].add(norm(fu))                 # no await between check and add, so this is safe
-    job["bucket"].append((n, fu, title))
-    return True
-
-
-async def scrape_link(ctx, sem, row, job):
-    async with sem:
-        pg = await ctx.new_page()
-        try:
-            await pg.goto(row["href"], wait_until="domcontentloaded", timeout=20000)
-            data = await pg.evaluate(EXTRACT_JS)
-            if not data["title"] and await click_age_gate(pg, quick=True):
-                data = await pg.evaluate(EXTRACT_JS)
-            ok = add_result(job, row["n"], data)
-            log(f"[{row['n']}] {'NEW ' if ok else 'skip'} {row['href']}")
-        except Exception as e:
-            log(f"[{row['n']}] fail {row['href']}: {str(e)[:70]}")
-        finally:
-            await pg.close()
-
-
-async def click_worker(browser, cookies, wid, job, rows):
-    """Thumbnails with no link: click by index, read the page that opens, come back.
-    Each worker has its OWN browser context, so workers can never touch each other's tabs."""
-    wctx = await make_ctx(browser, cookies)
-    page = await wctx.new_page()
-    need_all = max(r["n"] for r in rows)         # make sure this worker's highest index is loaded
-    try:
-        sel = await load_list(page, job["main"], need=need_all)
-    except Exception as e:
-        log(f"[worker {wid}] cannot load list: {str(e)[:80]}")
-        await wctx.close()
-        return
-    for row in rows:
-        n = row["n"]
-        try:
-            before_pages = set(wctx.pages)
-            before_url = page.url
-            ok = await page.evaluate(CLICK_JS, [sel, n - 1])
-            if not ok:
-                sel = await load_list(page, job["main"], need=need_all)
-                ok = await page.evaluate(CLICK_JS, [sel, n - 1])
-            target = None
-            for _ in range(30):                      # wait up to ~6s for a new tab or URL change
-                await page.wait_for_timeout(200)
-                new = [p for p in wctx.pages if p not in before_pages]
-                if new:
-                    target = new[-1]
-                    break
-                if page.url != before_url:
-                    target = page
-                    break
-            if target is None:
-                log(f"[{n}] click fail: nothing opened")
-                continue
-            try:
-                await target.wait_for_load_state("domcontentloaded", timeout=10000)
-            except Exception:
-                pass
-            data = await target.evaluate(EXTRACT_JS)
-            added = add_result(job, n, data)
-            log(f"[{n}] {'NEW ' if added else 'skip'} (click) {target.url}")
-            if target is not page:
-                await target.close()
-            else:
-                sel = await load_list(page, job["main"], need=need_all)   # back to the list
-        except Exception as e:
-            log(f"[{n}] click fail: {str(e)[:70]}")
-            try:
-                sel = await load_list(page, job["main"], need=need_all)
-            except Exception:
-                pass
-    await wctx.close()
-
-
-async def scrape_main(browser, ctx, main_url, seen):
-    """Scrapes ONE main URL. Returns the list of NEW (n, final_url, title) for that URL only."""
+async def list_reels(ctx, main_url, seen):
+    """Opens one main URL and returns the NEW reel links on it (ads, creator cards and saved reels left out)."""
     global BLOCK
     BLOCK = False
-    bucket = []
-    job = {"main": main_url, "seen": seen, "bucket": bucket}
     page = await ctx.new_page()
     try:
-        sel = await load_list(page, main_url, first=True)
+        sel = await load_list(page, main_url)
         info = await page.eval_on_selector_all(sel, LIST_JS)
-        debug = await page.evaluate(DEBUG_JS, sel)
     except Exception as e:
         log("ERROR on main page:", e)
         try:
@@ -446,50 +544,108 @@ async def scrape_main(browser, ctx, main_url, seen):
             pass
         await page.close()
         raise
-    cookies = await ctx.cookies()
     await page.close()
 
     info = info[:HOW_MANY]
-    rows = [{"n": i + 1, "href": good_link(x["href"], main_url)} for i, x in enumerate(info)]
-    ads      = [r for r in rows if r["href"] and "/vast_" in r["href"]]     # ad tiles, never reels
-    others   = [r for r in rows if r["href"] and "/vast_" not in r["href"] and not is_reel_url(r["href"])]  # creator cards etc.
-    rows     = [r for r in rows if r not in ads and r not in others]
-    linked   = [r for r in rows if r["href"]]
-    unlinked = [r for r in rows if not r["href"]]
-    skipped  = [r for r in linked if norm(r["href"]) in seen]
-    uniq, seen_h = [], set()                     # a reel can appear twice on a page; open it once
-    for r in linked:
-        k = norm(r["href"])
-        if k not in seen and k not in seen_h:
-            seen_h.add(k)
-            uniq.append(r)
-    linked = uniq
-    log(f"Selector '{sel}': {len(info)} thumbnails | {len(linked)} new links, "
-        f"{len(skipped)} already saved, {len(unlinked)} need click, {len(ads)} ads ignored, "
-        f"{len(others)} non-reel links ignored")
-    if unlinked and debug:
-        log("Thumbnail HTML (child -> parents) for debugging:")
-        for d in debug:
-            log("  ", d.replace("\n", " "))
+    hrefs, ads, others, nolink = [], 0, 0, 0
+    for x in info:
+        h = x["href"]
+        if not h:
+            nolink += 1
+        elif "/vast_" in h:
+            ads += 1
+        elif not is_reel_url(h):
+            others += 1
+        else:
+            hrefs.append(h)
+    uniq, keys = [], set()
+    for h in hrefs:
+        if norm(h) not in keys:
+            keys.add(norm(h))
+            uniq.append(h)
+    new = [h for h in uniq if norm(h) not in seen]
+    log(f"{len(info)} tiles | {len(uniq)} reels: {len(uniq) - len(new)} already saved, {len(new)} new | "
+        f"ignored: {ads} ads, {others} non-reel links, {nolink} without link")
+    return new
 
-    BLOCK = True
+
+async def open_reel(ctx, url):
+    """Opens a reel page and collects title, final url and every possible video address."""
+    pg = await ctx.new_page()
+    sniffed = []
+
+    def on_request(req):
+        u = req.url
+        if req.resource_type == "media" or re.search(r"\.(mp4|webm|m3u8|mov|m4v)(\?|$)", u, re.I):
+            sniffed.append(u)
+
+    pg.on("request", on_request)
     try:
-        tasks = []
-        if linked:
-            sem = asyncio.Semaphore(CONCURRENCY)
-            tasks += [scrape_link(ctx, sem, r, job) for r in linked]
-        if unlinked:
-            k = max(1, min(CLICK_WORKERS, len(unlinked)))
-            for w in range(k):
-                tasks.append(click_worker(browser, cookies, w + 1, job, unlinked[w::k]))
-        await asyncio.gather(*tasks)
+        await pg.goto(url, wait_until="domcontentloaded", timeout=25000)
+        data = await pg.evaluate(EXTRACT_JS)
+        if not data["title"] and await click_age_gate(pg, quick=True):
+            data = await pg.evaluate(EXTRACT_JS)
+        cands = []
+        for _ in range(8):                                   # wait up to ~4s for the player to set its source
+            cands = await pg.evaluate(VIDEO_JS)
+            if cands or sniffed:
+                break
+            await pg.wait_for_timeout(500)
+        try:
+            await pg.evaluate("() => { const v = document.querySelector('video'); if (v && v.play) v.play().catch(() => {}); }")
+        except Exception:
+            pass
+        await pg.wait_for_timeout(800)
+        cands = await pg.evaluate(VIDEO_JS)
+        cands += [{"url": u, "kind": "net"} for u in dict.fromkeys(sniffed)]
+        debug = None
+        if not pick_video(cands):
+            try:
+                debug = await pg.evaluate(DEBUG_VIDEO_JS)
+            except Exception:
+                debug = None
+        return {**data, "cands": cands, "debug": debug}
     finally:
-        BLOCK = False
-    bucket.sort(key=lambda t: t[0])
-    return bucket
+        await pg.close()
+
+
+async def handle_reel(ctx, sem, url, seen=None):
+    """Opens one reel, downloads its video into downloads/. Returns a dict, or None when it is a duplicate."""
+    global DEBUG_SHOWN
+    async with sem:
+        try:
+            info = await open_reel(ctx, url)
+        except Exception as e:
+            log(f"  fail (open) {url}: {str(e)[:70]}")
+            return {"error": "open"}
+        fu = info["final_url"]
+        title = clean_cell(info["title"])
+        if not is_reel_url(fu) or not title:               # age gate / redirect: try again next run
+            log(f"  fail (not a reel page) {url} -> {fu}")
+            return {"error": "not a reel page"}
+        if seen is not None:
+            if norm(fu) in seen:
+                return None
+            seen.add(norm(fu))                              # no await between check and add, so this is safe
+        res = {"final_url": fu, "title": title, "filename": ""}
+        cand = pick_video(info["cands"])
+        if not cand:
+            log(f"  no video address found: {fu}")
+            if DEBUG_SHOWN < 3 and info.get("debug"):
+                DEBUG_SHOWN += 1
+                log(f"     debug: {info['debug']}")
+                log(f"     candidates: {[c['url'][:90] for c in info['cands']][:5]}")
+            return res
+        try:
+            res["filename"] = await asyncio.to_thread(download_video, cand["url"], fu, post_id(fu))
+            log(f"  ok  {res['filename']}   <-  {fu}")
+        except Exception as e:
+            log(f"  download failed {fu}: {str(e)[:100]}")
+        return res
 
 
 async def main():
+    global BLOCK
     t0 = time.time()
     urls = get_main_urls()
     if not urls:
@@ -499,59 +655,88 @@ async def main():
 
     mega_pull()
     wb = load_wb()
+    migrated = migrate_wb(wb)
     removed = purge_bad_rows(wb)
-    if removed:
-        log(f"Removed {removed} rows from the sheet that were not reel pages (creator links / home page)")
-
-    # What is REALLY saved = the rows in the sheet. The txt is rebuilt from it, so the two can never drift apart.
-    seen, seen_list = set(), []
-    for u in sheet_urls(wb):
-        if norm(u) not in seen:
-            seen.add(norm(u))
-            seen_list.append(u)
-    txt_urls = [u for u in read_txt() if is_reel_url(u)]
-    txt_only = [u for u in txt_urls if norm(u) not in seen]
-    log(f"Sheet rows saved: {len(seen_list)} | urls in txt: {len(txt_urls)}")
+    saved, pending = scan(wb)
+    seen = set(saved)
+    USED_NAMES.update(sheet_filenames(wb))
+    log(f"Reels in the sheet: {len(saved)} | without a downloaded file yet: {len(pending)}")
     for ws in wb.worksheets:
         log(f"  tab '{ws.title}': {max(ws.max_row - 1, 0)} rows")
-    if txt_only:
-        log(f"{len(txt_only)} urls were in the txt but NOT in the sheet -> they will be scraped again and saved properly")
-    dirty = bool(txt_only) or removed > 0 or len(read_txt()) != len(seen_list)   # sheet/txt need a clean-up upload
+    if migrated:
+        log(f"Converted {migrated} old tab(s) to the layout: filename | title | final_url")
+    if removed:
+        log(f"Removed {removed} rows that were not reel pages (creator links / home page)")
+    dirty = bool(migrated or removed)
 
-    ok_count, total_new = 0, 0
+    ok_count, total_new, total_files = 0, 0, 0
     async with async_playwright() as p:
         # uses the Google Chrome already installed on GitHub runners (no browser download needed)
         browser = await p.chromium.launch(
             channel="chrome", headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         ctx = await make_ctx(browser)
 
-        for main_url in urls:                      # one main URL at a time: scrape -> save -> next
+        # ---- 1) reels that are already in the sheet but were never downloaded
+        if pending:
+            log(f"\n=== Downloading {len(pending)} reel(s) that are in the sheet but have no file yet ===")
+            sem = asyncio.Semaphore(CONCURRENCY)
+            for chunk in chunks(pending, CHUNK):
+                BLOCK = True
+                results = await asyncio.gather(*(handle_reel(ctx, sem, url) for _, _, url in chunk))
+                BLOCK = False
+                upload_downloads()
+                got = 0
+                for (ws, r, url), res in zip(chunk, results):
+                    fn = uploaded_name(res)
+                    if fn:
+                        ws.cell(row=r, column=1).value = fn
+                        if res.get("title") and not ws.cell(row=r, column=2).value:
+                            ws.cell(row=r, column=2).value = res["title"]
+                        got += 1
+                total_files += got
+                log(f"  {got}/{len(chunk)} reels now on Mega")
+                persist(wb)
+                dirty = False
+
+        # ---- 2) new reels from every main URL: one main URL at a time (scrape -> download -> upload -> save)
+        for main_url in urls:
             tab = tab_name(main_url)
             log(f"\n=== {main_url}  ->  tab '{tab}' ===")
             try:
-                new_rows = await scrape_main(browser, ctx, main_url, seen)
+                new_hrefs = await list_reels(ctx, main_url, seen)
             except Exception as e:
                 log(f"Skipped this URL: {str(e)[:120]}")
                 continue
             ok_count += 1
             created = tab not in wb.sheetnames
             ws = get_ws(wb, tab)
-            for _, fu, title in new_rows:
-                ws.append([fu, title])
-                seen_list.append(fu)
-            total_new += len(new_rows)
-            log(f"{len(new_rows)} new rows -> tab '{tab}' (tab now has {max(ws.max_row - 1, 0)} rows)")
-            if new_rows or created:
-                dirty = True
-            if dirty:
-                persist(wb, seen_list)             # upload before starting the next main URL
+            sem = asyncio.Semaphore(CONCURRENCY)
+            added = 0
+            for chunk in chunks(new_hrefs, CHUNK):
+                BLOCK = True
+                results = await asyncio.gather(*(handle_reel(ctx, sem, h, seen=seen) for h in chunk))
+                BLOCK = False
+                upload_downloads()
+                for res in results:
+                    if not res or res.get("error"):
+                        continue
+                    fn = uploaded_name(res)
+                    ws.append([fn, res["title"], res["final_url"]])
+                    added += 1
+                    total_files += 1 if fn else 0
+                persist(wb)
+                dirty = False
+            total_new += added
+            log(f"{added} new reels -> tab '{tab}' (tab now has {max(ws.max_row - 1, 0)} rows)")
+            if added == 0 and (created or dirty):
+                persist(wb)
                 dirty = False
         await browser.close()
 
-    if dirty and wb.sheetnames:
-        persist(wb, seen_list)
-
-    log(f"\nDone in {time.time()-t0:.0f}s: {total_new} new reels, {ok_count}/{len(urls)} main URLs worked")
+    if dirty:
+        persist(wb)
+    log(f"\nDone in {time.time() - t0:.0f}s: {total_new} new reels saved to the sheet, "
+        f"{total_files} video file(s) uploaded to Mega folder '{MEGA_DIR}', {ok_count}/{len(urls)} main URLs worked")
     return 0 if ok_count else 1
 
 
